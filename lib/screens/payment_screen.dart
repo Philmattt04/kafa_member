@@ -1,0 +1,558 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_stripe/flutter_stripe.dart';
+import '../services/payment_service.dart';
+import '../stripe_web_helper.dart'
+    if (dart.library.html) '../stripe_web_helper_web.dart';
+import 'payment_confirmation_screen.dart';
+
+/// Data passed into the payment screen from the member's policy view.
+class PaymentArgs {
+  final String memberId;
+  final String policyId;
+  final String memberName;
+  final int amountCents;
+  final String periodStart;
+  final String periodEnd;
+  final String currency;
+
+  const PaymentArgs({
+    required this.memberId,
+    required this.policyId,
+    required this.memberName,
+    required this.amountCents,
+    required this.periodStart,
+    required this.periodEnd,
+    this.currency = 'usd',
+  });
+
+  String get formattedAmount {
+    final amount = amountCents / 100;
+    return 'HTG ${amount.toStringAsFixed(2)}';
+  }
+}
+
+// ── Color palette ─────────────────────────────────────────────────────────────
+class _KafaColors {
+  static const background    = Color(0xFFF2F4F7);
+  static const surface       = Color(0xFFFFFFFF);
+  static const green         = Color(0xFF1A5C2A);
+  static const greenLight    = Color(0xFF236B35);
+  static const textPrimary   = Color(0xFF1A1A1A);
+  static const textSecondary = Color(0xFF6B7280);
+  static const textMuted     = Color(0xFF9CA3AF);
+  static const error         = Color(0xFFDC2626);
+  static const divider       = Color(0xFFE5E7EB);
+}
+
+class PaymentScreen extends StatefulWidget {
+  final PaymentArgs args;
+
+  const PaymentScreen({super.key, required this.args});
+
+  @override
+  State<PaymentScreen> createState() => _PaymentScreenState();
+}
+
+class _PaymentScreenState extends State<PaymentScreen>
+    with SingleTickerProviderStateMixin {
+  final _paymentService = PaymentService();
+  bool _isProcessing = false;
+  String? _cardError;
+  late AnimationController _pulseController;
+  late Animation<double> _pulseAnim;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulseController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1400),
+    )..repeat(reverse: true);
+    _pulseAnim = Tween<double>(begin: 0.6, end: 1.0).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+    if (kIsWeb) {
+      const pk = String.fromEnvironment('STRIPE_KEY', defaultValue: '');
+      if (pk.isNotEmpty) registerStripeCardViewFactory(pk);
+    }
+  }
+
+  @override
+  void dispose() {
+    _pulseController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _handlePayment() async {
+    setState(() {
+      _isProcessing = true;
+      _cardError = null;
+    });
+    HapticFeedback.lightImpact();
+
+    final result = await _paymentService.processPayment(
+      memberId: widget.args.memberId,
+      policyId: widget.args.policyId,
+      amountCents: widget.args.amountCents,
+      periodStart: widget.args.periodStart,
+      periodEnd: widget.args.periodEnd,
+      currency: widget.args.currency,
+    );
+
+    if (!mounted) return;
+
+    if (result.success) {
+      HapticFeedback.mediumImpact();
+      await Navigator.pushReplacement(
+        context,
+        PageRouteBuilder(
+          pageBuilder: (_, animation, __) => FadeTransition(
+            opacity: animation,
+            child: PaymentConfirmationScreen(
+              args: widget.args,
+              paymentId: result.paymentId!,
+            ),
+          ),
+          transitionDuration: const Duration(milliseconds: 500),
+        ),
+      );
+    } else {
+      HapticFeedback.heavyImpact();
+      setState(() {
+        _isProcessing = false;
+        _cardError = result.errorMessage;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: _KafaColors.background,
+      body: SafeArea(
+        child: Column(
+          children: [
+            _buildHeader(),
+            Expanded(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.symmetric(horizontal: 24),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const SizedBox(height: 28),
+                    _buildAmountCard(),
+                    const SizedBox(height: 28),
+                    _buildSectionLabel('Card Details'),
+                    const SizedBox(height: 12),
+                    _buildCardFields(),
+                    if (_cardError != null) ...[
+                      const SizedBox(height: 10),
+                      _buildErrorBanner(_cardError!),
+                    ],
+                    if (widget.args.periodEnd.isNotEmpty) ...[
+                      const SizedBox(height: 28),
+                      _buildSectionLabel('Due Date'),
+                      const SizedBox(height: 12),
+                      _buildInfoTile(
+                        label: 'Next payment due',
+                        value: _formatDate(widget.args.periodEnd),
+                        icon: Icons.calendar_today_rounded,
+                      ),
+                    ],
+                    const SizedBox(height: 36),
+                    _buildPayButton(),
+                    const SizedBox(height: 20),
+                    _buildSecurityNote(),
+                    const SizedBox(height: 32),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Header ────────────────────────────────────────────────────────────────
+  Widget _buildHeader() {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+      decoration: const BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: _KafaColors.divider, width: 1),
+        ),
+      ),
+      child: Row(
+        children: [
+          GestureDetector(
+            onTap: () => Navigator.pop(context),
+            child: Container(
+              width: 38,
+              height: 38,
+              decoration: BoxDecoration(
+                color: _KafaColors.surface,
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: _KafaColors.divider),
+              ),
+              child: const Icon(
+                Icons.arrow_back_ios_new_rounded,
+                color: _KafaColors.textSecondary,
+                size: 16,
+              ),
+            ),
+          ),
+          const SizedBox(width: 14),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                'Pay Premium',
+                style: TextStyle(
+                  color: _KafaColors.textPrimary,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                  letterSpacing: 0.2,
+                ),
+              ),
+              Text(
+                widget.args.memberName,
+                style: const TextStyle(
+                  color: _KafaColors.textSecondary,
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+          const Spacer(),
+          // KAFA gold emblem
+          Container(
+            width: 36,
+            height: 36,
+            decoration: BoxDecoration(
+              color: _KafaColors.green,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Center(
+              child: Text(
+                'K',
+                style: TextStyle(
+                  color: _KafaColors.background,
+                  fontSize: 18,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: -0.5,
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Amount card ───────────────────────────────────────────────────────────
+  Widget _buildAmountCard() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(24),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Color(0xFF1A5C2A), Color(0xFF236B35)],
+        ),
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: _KafaColors.green.withValues(alpha: 0.2),
+            blurRadius: 24,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: const Text(
+                  'Monthly Premium',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.8,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          Text(
+            widget.args.formattedAmount,
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 42,
+              fontWeight: FontWeight.w300,
+              letterSpacing: -1.5,
+              height: 1,
+            ),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'Policy · ${widget.args.policyId}',
+            style: TextStyle(
+              color: Colors.white.withValues(alpha: 0.7),
+              fontSize: 13,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Card fields ───────────────────────────────────────────────────────────
+  Widget _buildCardFields() {
+    if (!kIsWeb) {
+      // Native: single combined CardField
+      return Container(
+        height: 54,
+        decoration: BoxDecoration(
+          color: _KafaColors.surface,
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(
+            color: _cardError != null
+                ? _KafaColors.error.withValues(alpha: 0.6)
+                : _KafaColors.divider,
+          ),
+        ),
+        child: CardField(
+          onCardChanged: (details) {
+            if (_cardError != null && details != null) {
+              setState(() => _cardError = null);
+            }
+          },
+          decoration: const InputDecoration(
+            border: InputBorder.none,
+            contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          ),
+          style: const TextStyle(color: _KafaColors.textPrimary, fontSize: 15),
+        ),
+      );
+    }
+    // Web: three separate Stripe elements
+    return Column(
+      children: [
+        _buildStripeField('Card Number', stripeCardHtmlView()),
+        const SizedBox(height: 12),
+        Row(
+          children: [
+            Expanded(child: _buildStripeField('Expiry', stripeExpiryHtmlView())),
+            const SizedBox(width: 12),
+            Expanded(child: _buildStripeField('CVC', stripeCvcHtmlView())),
+          ],
+        ),
+      ],
+    );
+  }
+
+  Widget _buildStripeField(String label, Widget field) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          label,
+          style: const TextStyle(
+            color: _KafaColors.textMuted,
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            letterSpacing: 0.8,
+          ),
+        ),
+        const SizedBox(height: 6),
+        Container(
+          height: 48,
+          decoration: BoxDecoration(
+            color: _KafaColors.surface,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(color: _KafaColors.divider),
+          ),
+          child: MouseRegion(
+            cursor: SystemMouseCursors.text,
+            child: field,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildInfoTile({
+    required String label,
+    required String value,
+    required IconData icon,
+  }) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _KafaColors.surface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: _KafaColors.divider),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, color: _KafaColors.green, size: 15),
+          const SizedBox(width: 8),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(label,
+                  style: const TextStyle(
+                      color: _KafaColors.textMuted, fontSize: 11)),
+              const SizedBox(height: 2),
+              Text(value,
+                  style: const TextStyle(
+                      color: _KafaColors.textPrimary,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500)),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Pay button ────────────────────────────────────────────────────────────
+  Widget _buildPayButton() {
+    return AnimatedBuilder(
+      animation: _pulseAnim,
+      builder: (_, child) {
+        return GestureDetector(
+          onTap: _isProcessing ? null : _handlePayment,
+          child: Container(
+            width: double.infinity,
+            height: 56,
+            decoration: BoxDecoration(
+              gradient: LinearGradient(
+                colors: _isProcessing
+                    ? [_KafaColors.greenLight, _KafaColors.greenLight]
+                    : [_KafaColors.green, _KafaColors.greenLight],
+                begin: Alignment.centerLeft,
+                end: Alignment.centerRight,
+              ),
+              borderRadius: BorderRadius.circular(14),
+              boxShadow: _isProcessing
+                  ? []
+                  : [
+                      BoxShadow(
+                        color: _KafaColors.green
+                            .withValues(alpha: 0.3 * _pulseAnim.value),
+                        blurRadius: 20,
+                        offset: const Offset(0, 6),
+                      ),
+                    ],
+            ),
+            child: Center(
+              child: _isProcessing
+                  ? const SizedBox(
+                      width: 22,
+                      height: 22,
+                      child: CircularProgressIndicator(
+                        strokeWidth: 2.5,
+                        valueColor: AlwaysStoppedAnimation(_KafaColors.background),
+                      ),
+                    )
+                  : Text(
+                      'Pay ${widget.args.formattedAmount}',
+                      style: const TextStyle(
+                        color: _KafaColors.background,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w700,
+                        letterSpacing: 0.3,
+                      ),
+                    ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  // ── Error banner ──────────────────────────────────────────────────────────
+  Widget _buildErrorBanner(String message) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: _KafaColors.error.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: _KafaColors.error.withValues(alpha: 0.4)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.error_outline_rounded,
+              color: _KafaColors.error, size: 16),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              message,
+              style: const TextStyle(
+                  color: _KafaColors.error, fontSize: 13),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ── Security note ─────────────────────────────────────────────────────────
+  Widget _buildSecurityNote() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: const [
+        Icon(Icons.lock_outline_rounded,
+            color: _KafaColors.textMuted, size: 13),
+        SizedBox(width: 6),
+        Text(
+          'Secured by Stripe · PCI DSS Level 1',
+          style: TextStyle(color: _KafaColors.textMuted, fontSize: 12),
+        ),
+      ],
+    );
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+  Widget _buildSectionLabel(String label) {
+    return Text(
+      label.toUpperCase(),
+      style: const TextStyle(
+        color: _KafaColors.textMuted,
+        fontSize: 11,
+        fontWeight: FontWeight.w600,
+        letterSpacing: 1.2,
+      ),
+    );
+  }
+
+  String _formatDate(String iso) {
+    // "2026-04-01" → "Apr 1, 2026"
+    try {
+      final parts = iso.split('-');
+      final months = [
+        '', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+        'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+      ];
+      final month = months[int.parse(parts[1])];
+      final day = int.parse(parts[2]);
+      return '$month $day, ${parts[0]}';
+    } catch (_) {
+      return iso;
+    }
+  }
+}
